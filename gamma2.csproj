@@ -6,7 +6,7 @@
     <Nullable>enable</Nullable>
     <UseWindowsForms>true</UseWindowsForms>
     <ImplicitUsings>enable</ImplicitUsings>
-    <AssemblyName>gamma slave extra</AssemblyName>
+    <AssemblyName>GammaTool</AssemblyName>
 	<AssemblyTitle>gamma slave extra</AssemblyTitle>
 	<AssemblyVersion>1.0.0.0</AssemblyVersion>
     <RootNamespace>$(MSBuildProjectName.Replace(" ", "_"))</RootNamespace>

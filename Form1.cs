@@ -1,10 +1,13 @@
 using System;
+using System.Buffers;
 using System.Collections.Generic;
 using System.Drawing;
 using System.Globalization;
 using System.IO;
 using System.Linq;
+using System.Net.WebSockets;
 using System.Runtime.InteropServices;
+using System.Text.Json;
 using System.Threading.Tasks;
 using System.Windows.Forms;
 using gamma2.Properties;
@@ -13,6 +16,9 @@ namespace rebellagamma
 {
     public partial class Form1 : Form
     {
+        [DllImport("gdi32.dll")]
+        static extern bool GetDeviceGammaRamp(IntPtr hdc, out RAMP lpRamp);
+        
         [DllImport("gdi32.dll")]
         static extern bool SetDeviceGammaRamp(IntPtr hDC, ref RAMP lpRamp);
 
@@ -33,9 +39,8 @@ namespace rebellagamma
             public ushort[] Blue;
         }
 
-        private (double gamma, int brightness, int contrast)? settingsAR1 = null;
-        private (double gamma, int brightness, int contrast)? settingsAR2 = null;
-        private double ar1Value, ar2Value;
+        private ARSetting? minARSetting = null;
+        private ARSetting? maxARSetting = null;
         private string ConfigFilePath => Path.Combine(Application.StartupPath, "config.txt");
         private FileSystemWatcher _configWatcher;
         private NotifyIcon notifyIcon;
@@ -90,6 +95,126 @@ namespace rebellagamma
             EnsureConfigFileExists();
             InitializeConfigWatcher();
             LoadProfiles();
+            _ = ConnectWithRetryAsync();
+        }
+
+        private async Task ConnectWithRetryAsync()
+        {
+            var uri = new Uri("ws://127.0.0.1:24050/websocket/v2");
+            var writer = new ArrayBufferWriter<byte>();
+            double lastAR = 0;
+            int lastState = 0;
+            
+            
+            while (true)
+            {
+                try
+                {
+                    using var ws = new ClientWebSocket();
+                    await ws.ConnectAsync(uri, CancellationToken.None);
+
+                    Invoke((MethodInvoker)delegate
+                    {
+                        numericUpDownTargetAR.Enabled = false;
+                        trackBarAR.Visible = false;
+                        buttonSetAR3.Visible = false;
+                        labelConnected.Visible = true;
+                        labelTosuInfo.Visible = true;
+                        labelTosuInfo.Text = "";
+                    });
+                    
+                    while (ws.State == WebSocketState.Open)
+                    {
+                        ValueWebSocketReceiveResult result;
+
+                        do
+                        {
+                            Memory<byte> memory = writer.GetMemory(2048);
+                            result = await ws.ReceiveAsync(memory, CancellationToken.None);
+                            writer.Advance(result.Count);
+                        } while (!result.EndOfMessage);
+
+                        if (result.MessageType == WebSocketMessageType.Close)
+                        {
+                            writer.Clear();
+                            Invoke((MethodInvoker)delegate
+                            {
+                                numericUpDownTargetAR.Enabled = true;
+                                trackBarAR.Visible = true;
+                                buttonSetAR3.Visible = true;
+                                labelConnected.Visible = false;
+                                labelTosuInfo.Visible = false;
+                            });
+                            break;
+                        }
+
+                        var message = JsonSerializer.Deserialize<TosuMessage>(writer.WrittenSpan);
+                        writer.Clear();
+                        
+                        //Console.WriteLine("State Id: " + message?.state?.number + " Name: " + message?.state?.name);
+                        //Console.WriteLine("Original: " + message?.beatmap?.stats?.ar?.original + " Converted: " + message?.beatmap?.stats?.ar?.converted);
+                        
+                        Invoke((MethodInvoker)delegate
+                        {
+                            // basic checks
+                            if (message?.state?.number == null)
+                                return;
+                            var state = message.state.number;
+                            
+                            if (message?.beatmap?.stats?.ar?.converted == null)
+                                return;
+                            var ar = message.beatmap.stats.ar.converted;
+                            
+                            // update AR on the UI
+                            if (Math.Abs(ar - lastAR) > 1e-6)
+                            {
+                                trackBarAR.Value = Convert.ToInt16(message.beatmap.stats.ar.converted * 100);
+                                numericUpDownTargetAR.Value = Convert.ToDecimal(message.beatmap.stats.ar.converted);
+                                lastAR = message.beatmap.stats.ar.converted;
+                            }
+                            
+                            // If AR settings bad, return.
+                            if (minARSetting == null || maxARSetting == null)
+                            {
+                                labelTosuInfo.ForeColor = Color.Red;
+                                labelTosuInfo.Text = "First, set the min and max AR settings.";
+                                return;
+                            }
+                            
+                            // Gamestate is not gameplay notification
+                            if (state != 2)
+                            {
+                                labelTosuInfo.ForeColor = Color.Yellow;
+                                labelTosuInfo.Text = "Gamestate: " + message?.state?.number + message?.state?.name;
+                            }
+                            else
+                            {
+                                labelTosuInfo.ForeColor = Color.Green;
+                                labelTosuInfo.Text = "Adjusting AR for gameplay";
+                            }
+                            
+                            // Everything down will change windows settings, so only change if input state has changed.
+                            if (lastState == state && Math.Abs(ar - lastAR) < 1e-6)
+                                return;
+                            
+                            if (state == 2 && lastState != 2)
+                                _ = InterpolateAR(); // Entering gameplay
+                            if (lastState == 2 && state != 2)
+                                Reset(); // Exiting gameplay
+
+                            lastState = state;
+                            lastAR = ar;
+                        });
+                    }
+                }
+                catch(Exception e)
+                {
+                    Console.WriteLine(e);
+                    await Task.Delay(2000);
+                }
+            }
+            
+            
         }
 
         private void EnsureConfigFileExists()
@@ -161,19 +286,30 @@ namespace rebellagamma
             numericUpDown1.Value = (decimal)(trackBarGamma.Value / 100.0f);
             numericUpDown2.Value = (decimal)(trackBarBrightness.Value / 100.0f);
             numericUpDown3.Value = (decimal)(trackBarContrast.Value / 100.0f);
+            numericUpDownTargetAR.Value = (decimal)(trackBarAR.Value / 100.0f);
         }
-
+        
         private void ApplyAllSettings()
         {
             if (comboBoxMonitors.SelectedItem == null) return;
 
-            float gamma = trackBarGamma.Value / 100.0f;
-            if (gamma < 0.1f) gamma = 0.1f;
+            // 1. Ensure this string is formatted exactly like "\\.\DISPLAY1"
+            // You can get these from Screen.AllScreens[i].DeviceName
+            string deviceName = comboBoxMonitors.SelectedItem.ToString();
+            
+            // Pass null for lpszDriver, and the device name for lpszDevice
+            IntPtr hdc = CreateDC(null, deviceName, IntPtr.Zero, IntPtr.Zero);
+            
+            // Fallback to primary monitor if the handle failed to create
+            if (hdc == IntPtr.Zero)
+            {
+                hdc = CreateDC("DISPLAY", null, IntPtr.Zero, IntPtr.Zero);
+                if (hdc == IntPtr.Zero) return;
+            }
 
+            float gamma = Math.Max(trackBarGamma.Value / 100.0f, 0.1f);
             int brightness = trackBarBrightness.Value;
             float contrast = trackBarContrast.Value / 100.0f;
-
-            IntPtr hdc = CreateDC("DISPLAY", comboBoxMonitors.SelectedItem.ToString(), IntPtr.Zero, IntPtr.Zero);
 
             RAMP ramp = new RAMP()
             {
@@ -181,6 +317,8 @@ namespace rebellagamma
                 Green = new ushort[256],
                 Blue = new ushort[256]
             };
+
+            ushort lastVal = 0;
 
             for (int i = 0; i < 256; i++)
             {
@@ -190,19 +328,119 @@ namespace rebellagamma
                 double contrastAdjusted = ((gammaCorrected - 0.5) * contrast) + 0.5;
                 double brightnessAdjusted = contrastAdjusted + (brightness / 255.0);
 
-                double val = brightnessAdjusted;
-                if (val < 0) val = 0;
-                if (val > 1) val = 1;
+                int rampVal = (int)(Math.Clamp(brightnessAdjusted, 0.0, 1.0) * 65535);
 
-                int rampVal = (int)(val * 65535);
-                if (rampVal > 65535) rampVal = 65535;
-                if (rampVal < 0) rampVal = 0;
+                // 2. Enforce strict driver requirements
+                if (rampVal < lastVal) rampVal = lastVal; // Must constantly increase
+                if (i == 0) rampVal = 0;                  // Index 0 must be 0
+                if (i == 255) rampVal = 65535;            // Index 255 must be 65535
 
+                lastVal = (ushort)rampVal;
                 ramp.Red[i] = ramp.Green[i] = ramp.Blue[i] = (ushort)rampVal;
             }
 
-            SetDeviceGammaRamp(hdc, ref ramp);
+            bool success = SetDeviceGammaRamp(hdc, ref ramp);
+            
+            if (!success)
+            {
+                int err = System.Runtime.InteropServices.Marshal.GetLastWin32Error();
+                Console.WriteLine($"SetDeviceGammaRamp failed. Error Code: {err}");
+            }
+
             DeleteDC(hdc);
+        }
+
+        private async Task ApplyAllSettingsGradually()
+        {
+            if (comboBoxMonitors.SelectedItem == null) return;
+
+            string deviceName = comboBoxMonitors.SelectedItem.ToString();
+            IntPtr hdc = CreateDC(null, deviceName, IntPtr.Zero, IntPtr.Zero);
+            if (hdc == IntPtr.Zero) hdc = CreateDC("DISPLAY", null, IntPtr.Zero, IntPtr.Zero);
+            if (hdc == IntPtr.Zero) return;
+
+            // 1. Get current hardware state
+            if (!GetDeviceGammaRamp(hdc, out RAMP currentRamp))
+            {
+                DeleteDC(hdc);
+                return;
+            }
+
+            // 2. Generate the target state (using your hardened math from earlier)
+            RAMP targetRamp = GenerateTargetRamp(); 
+
+            // 3. Interpolate and apply over 10 steps (~250ms)
+            int steps = 10;
+            for (int step = 1; step <= steps; step++)
+            {
+                RAMP stepRamp = new RAMP() 
+                { 
+                    Red = new ushort[256], Green = new ushort[256], Blue = new ushort[256] 
+                };
+        
+                double progress = (double)step / steps;
+
+                for (int i = 0; i < 256; i++)
+                {
+                    // Linear interpolation between current and target
+                    stepRamp.Red[i] = (ushort)(currentRamp.Red[i] + (targetRamp.Red[i] - currentRamp.Red[i]) * progress);
+                    stepRamp.Green[i] = (ushort)(currentRamp.Green[i] + (targetRamp.Green[i] - currentRamp.Green[i]) * progress);
+                    stepRamp.Blue[i] = (ushort)(currentRamp.Blue[i] + (targetRamp.Blue[i] - currentRamp.Blue[i]) * progress);
+                }
+
+                SetDeviceGammaRamp(hdc, ref stepRamp);
+        
+                // Wait 25ms before the next step (10 * 25ms = 250ms total)
+                await Task.Delay(25); 
+            }
+
+            DeleteDC(hdc);
+        }
+        
+        private RAMP GenerateTargetRamp()
+        {
+            float gamma = Math.Max(trackBarGamma.Value / 100.0f, 0.1f);
+            int brightness = trackBarBrightness.Value;
+            float contrast = trackBarContrast.Value / 100.0f;
+
+            RAMP ramp = new RAMP()
+            {
+                Red = new ushort[256],
+                Green = new ushort[256],
+                Blue = new ushort[256]
+            };
+
+            ushort lastVal = 0;
+
+            for (int i = 0; i < 256; i++)
+            {
+                double normalized = i / 255.0;
+
+                double gammaCorrected = Math.Pow(normalized, 1.0 / gamma);
+                double contrastAdjusted = ((gammaCorrected - 0.5) * contrast) + 0.5;
+                double brightnessAdjusted = contrastAdjusted + (brightness / 255.0);
+
+                double clamped = Math.Clamp(brightnessAdjusted, 0.0, 1.0);
+                int rampVal = (int)(clamped * 65535);
+
+                if (rampVal < lastVal) 
+                {
+                    rampVal = lastVal;
+                }
+
+                if (i > 0 && rampVal == lastVal && rampVal < 65535)
+                {
+                    rampVal = lastVal + 1;
+                }
+
+                lastVal = (ushort)rampVal;
+                ramp.Red[i] = ramp.Green[i] = ramp.Blue[i] = (ushort)rampVal;
+            }
+
+            ramp.Red[0] = ramp.Green[0] = ramp.Blue[0] = 0;
+            ramp.Red[255] = ramp.Green[255] = ramp.Blue[255] = 65535;
+
+            return ramp;
         }
 
         private void trackBarGamma_Scroll(object sender, EventArgs e)
@@ -226,12 +464,24 @@ namespace rebellagamma
             panelGraph.Invalidate();
         }
 
+        private void trackBarAR_Scroll(object sender, EventArgs e)
+        {
+            ApplyAllSettings();
+            UpdateValueLabels();
+            panelGraph.Invalidate();
+        }
+
         private void comboBoxMonitors_SelectedIndexChanged(object sender, EventArgs e)
         {
             ApplyAllSettings();
         }
 
         private void buttonReset_Click(object sender, EventArgs e)
+        {
+            Reset();
+        }
+
+        private void Reset()
         {
             trackBarGamma.Value = 100;
             trackBarBrightness.Value = 0;
@@ -243,46 +493,59 @@ namespace rebellagamma
 
         private void buttonSaveAR1_Click(object sender, EventArgs e)
         {
-            double ar1 = (double)numericUpDownAR1.Value;
-            ar1 = ApplyDTIfChecked(ar1, checkBoxDT1);
-            ar1Value = ar1;
-            settingsAR1 = GetCurrentSettings();
-            labelAR1.Text = $"AR1: {ar1:F2} | G: {settingsAR1.Value.gamma:0.00} | B: {settingsAR1.Value.brightness} | C: {settingsAR1.Value.contrast}";
+            minARSetting = GetCurrentSettings();
+            SetAR1Text();
             this.ActiveControl = null;
         }
 
         private void buttonSaveAR2_Click(object sender, EventArgs e)
         {
-            double ar2 = (double)numericUpDownAR2.Value;
-            ar2 = ApplyDTIfChecked(ar2, checkBoxDT2);
-            ar2Value = ar2;
-            settingsAR2 = GetCurrentSettings();
-            labelAR2.Text = $"AR2: {ar2:F2} | G: {settingsAR2.Value.gamma:0.00} | B: {settingsAR2.Value.brightness} | C: {settingsAR2.Value.contrast}";
+            maxARSetting = GetCurrentSettings();
+            SetAR2Text();
             this.ActiveControl = null;
         }
 
-        private void buttonSetAR3_Click(object sender, EventArgs e)
+        private void SetAR1Text()
+            => labelAR1.Text = minARSetting != null ? $"Min AR: {minARSetting.AR:F2} | G: {minARSetting.Colors.Gamma:0.00} | B: {minARSetting.Colors.Brightness} | C: {minARSetting.Colors.Contrast}" : "Min AR: -"; 
+        
+        private void SetAR2Text()
+            => labelAR2.Text = maxARSetting != null ? $"Max AR: {maxARSetting.AR:F2} | G: {maxARSetting.Colors.Gamma:0.00} | B: {maxARSetting.Colors.Brightness} | C: {maxARSetting.Colors.Contrast}" : "Max AR: -";
+
+        private async void buttonSetAR3_Click(object sender, EventArgs e)
         {
-            if (settingsAR1 == null || settingsAR2 == null)
+            if (minARSetting == null || maxARSetting == null)
             {
                 MessageBox.Show("First, save the AR1 and AR2 settings.");
                 return;
             }
 
-            double ar3 = (double)numericUpDownTargetAR.Value;
-            ar3 = ApplyDTIfChecked(ar3, checkBoxDT3);
-
-            if (Math.Abs(ar2Value - ar1Value) < 1e-6)
+            if (Math.Abs(maxARSetting.AR - minARSetting.AR) < 1e-6)
             {
                 MessageBox.Show("AR1 and AR2 have the same value; interpolation is not possible.");
                 return;
             }
+            
+            await InterpolateAR();
+        }
 
-            double factor = (ar3 - ar1Value) / (ar2Value - ar1Value);
+        private async Task InterpolateAR()
+        {
+            var targetAR = trackBarAR.Value / 100f;
+            double factor = 0;
+            if (Math.Abs(maxARSetting.AR - minARSetting.AR) > 1e-6)
+            {
+                factor = (targetAR - minARSetting.AR) /
+                         (maxARSetting.AR - minARSetting.AR);
+                factor = Math.Max(0, Math.Min(1, factor));
+            }
+            else if (targetAR > minARSetting.AR)
+                factor = 1;
+            else
+                factor = 0;
 
-            double gamma = Lerp(settingsAR1.Value.gamma, settingsAR2.Value.gamma, factor);
-            int brightness = (int)Math.Round(Lerp(settingsAR1.Value.brightness, settingsAR2.Value.brightness, factor));
-            int contrast = (int)Math.Round(Lerp(settingsAR1.Value.contrast, settingsAR2.Value.contrast, factor));
+            double gamma = Lerp(minARSetting.Colors.Gamma, maxARSetting.Colors.Gamma, factor);
+            int brightness = (int)Math.Round(Lerp(minARSetting.Colors.Brightness, maxARSetting.Colors.Brightness, factor));
+            int contrast = (int)Math.Round(Lerp(minARSetting.Colors.Contrast, maxARSetting.Colors.Contrast, factor));
 
             gamma = Math.Max(0.08, Math.Min(8.88, gamma));
             brightness = Math.Max(-888, Math.Min(888, brightness));
@@ -293,17 +556,23 @@ namespace rebellagamma
             trackBarContrast.Value = contrast;
 
             UpdateValueLabels();
-            ApplyAllSettings();
             panelGraph.Invalidate();
-
-            labelAR3.Text = $"AR3: {ar3:F2} | G: {gamma:0.00} | B: {brightness} | C: {contrast}";
-
             this.ActiveControl = null;
+            await ApplyAllSettingsGradually();
         }
 
-        private (double gamma, int brightness, int contrast) GetCurrentSettings()
+        private ARSetting GetCurrentSettings()
         {
-            return (trackBarGamma.Value / 100.0, trackBarBrightness.Value, trackBarContrast.Value);
+            return new()
+            {
+                AR = trackBarAR.Value / 100f,
+                Colors = new ColorSetting()
+                {
+                    Gamma = trackBarGamma.Value / 100.0,
+                    Brightness = trackBarBrightness.Value,
+                    Contrast = trackBarContrast.Value,
+                },
+            };
         }
 
         private bool TryParseAR(string text, out double value)
@@ -374,7 +643,7 @@ namespace rebellagamma
 
             var profile = GetCurrentSettings();
             string profileName = textBoxProfileName.Text;
-            string profileLine = $"{profileName}|{profile.gamma}|{profile.brightness}|{profile.contrast}";
+            string profileLine = $"{profileName}|{profile.Colors.Gamma}|{profile.Colors.Brightness}|{profile.Colors.Contrast}|{minARSetting?.AR}|{minARSetting?.Colors.Gamma}|{minARSetting?.Colors.Brightness}|{minARSetting?.Colors.Contrast}|{maxARSetting?.AR}|{maxARSetting?.Colors.Gamma}|{maxARSetting?.Colors.Brightness}|{maxARSetting?.Colors.Contrast}";
 
             try
             {
@@ -432,34 +701,41 @@ namespace rebellagamma
 
             string selectedProfile = comboBoxProfiles.SelectedItem.ToString();
             var profiles = GetSavedProfiles();
-            var profile = profiles.FirstOrDefault(p => p.Item1 == selectedProfile);
+            var profile = profiles.FirstOrDefault(p => p.Name == selectedProfile);
 
-            if (!profile.Equals(default((string, double, int, int))))
-            {
-                if (profile.Item1 != null)
-                {
-                    double gamma = Math.Max(0.08, Math.Min(8.88, profile.Item2));
-                    int brightness = Math.Max(-888, Math.Min(888, profile.Item3));
-                    int contrast = Math.Max(8, Math.Min(888, profile.Item4));
-
-                    trackBarGamma.Value = (int)(gamma * 100);
-                    trackBarBrightness.Value = brightness;
-                    trackBarContrast.Value = contrast;
-
-                    UpdateValueLabels();
-                    ApplyAllSettings();
-                    panelGraph.Invalidate();
-                }
-            }
+            LoadProfile(profile);
 
             buttonLoadProfile.Text = "Loaded!";
             await Task.Delay(1000);
             buttonLoadProfile.Text = "Load";
         }
 
-        private List<(string, double, int, int)> GetSavedProfiles()
+        private void LoadProfile(Profile profile)
         {
-            var profiles = new List<(string, double, int, int)>();
+            if (profile?.Name != null)
+            {
+                double gamma = Math.Max(0.08, Math.Min(8.88, profile.Colors.Gamma));
+                int brightness = Math.Max(-888, Math.Min(888, profile.Colors.Brightness));
+                int contrast = Math.Max(8, Math.Min(888, profile.Colors.Contrast));
+
+                minARSetting = profile.MinARSetting;
+                maxARSetting = profile.MaxARSetting;
+
+                trackBarGamma.Value = (int)(gamma * 100);
+                trackBarBrightness.Value = brightness;
+                trackBarContrast.Value = contrast;
+
+                SetAR1Text();
+                SetAR2Text();
+                UpdateValueLabels();
+                ApplyAllSettings();
+                panelGraph.Invalidate();
+            }
+        }
+
+        private List<Profile> GetSavedProfiles()
+        {
+            var profiles = new List<Profile>();
 
             try
             {
@@ -468,17 +744,64 @@ namespace rebellagamma
                     foreach (var line in File.ReadAllLines(ConfigFilePath))
                     {
                         var parts = line.Split('|');
-                        if (parts.Length == 4)
+                        if (parts.Length == 12)
                         {
                             string gammaStr = parts[1].Replace(',', '.');
                             string brightnessStr = parts[2].Replace(',', '.');
                             string contrastStr = parts[3].Replace(',', '.');
+                            
+                            string minArStr = parts[4].Replace(',', '.');
+                            string minGammaStr = parts[5].Replace(',', '.');
+                            string minBrightnessStr = parts[6].Replace(',', '.');
+                            string minContrastStr = parts[7].Replace(',', '.');
+                            
+                            string maxArStr = parts[8].Replace(',', '.');
+                            string maxGammaStr = parts[9].Replace(',', '.');
+                            string maxBrightnessStr = parts[10].Replace(',', '.');
+                            string maxContrastStr = parts[11].Replace(',', '.');
 
                             if (double.TryParse(gammaStr, NumberStyles.Float, CultureInfo.InvariantCulture, out double gamma) &&
                                 int.TryParse(brightnessStr, NumberStyles.Integer, CultureInfo.InvariantCulture, out int brightness) &&
-                                int.TryParse(contrastStr, NumberStyles.Integer, CultureInfo.InvariantCulture, out int contrast))
+                                int.TryParse(contrastStr, NumberStyles.Integer, CultureInfo.InvariantCulture, out int contrast) &&
+                                float.TryParse(minArStr, NumberStyles.Float, CultureInfo.InvariantCulture, out float minAr) &&
+                                double.TryParse(minGammaStr, NumberStyles.Float, CultureInfo.InvariantCulture, out double minGamma) &&
+                                int.TryParse(minBrightnessStr, NumberStyles.Integer, CultureInfo.InvariantCulture, out int minBrightness) &&
+                                int.TryParse(minContrastStr, NumberStyles.Integer, CultureInfo.InvariantCulture, out int minContrast) &&
+                                float.TryParse(maxArStr, NumberStyles.Float, CultureInfo.InvariantCulture, out float maxAr) &&
+                                double.TryParse(maxGammaStr, NumberStyles.Float, CultureInfo.InvariantCulture, out double maxGamma) &&
+                                int.TryParse(maxBrightnessStr, NumberStyles.Integer, CultureInfo.InvariantCulture, out int maxBrightness) &&
+                                int.TryParse(maxContrastStr, NumberStyles.Integer, CultureInfo.InvariantCulture, out int maxContrast))
                             {
-                                profiles.Add((parts[0], gamma, brightness, contrast));
+                                profiles.Add(new Profile()
+                                {
+                                    Name = parts[0],
+                                    Colors = new ColorSetting()
+                                    {
+                                        Gamma = gamma,
+                                        Brightness = brightness,
+                                        Contrast = contrast,
+                                    },
+                                    MinARSetting = new ARSetting()
+                                    {
+                                        AR = minAr,
+                                        Colors = new ColorSetting()
+                                        {
+                                            Gamma = minGamma,
+                                            Brightness = minBrightness,
+                                            Contrast = minContrast,
+                                        }
+                                    },
+                                    MaxARSetting =  new ARSetting()
+                                    {
+                                        AR = maxAr,
+                                        Colors = new ColorSetting()
+                                        {
+                                            Gamma = maxGamma,
+                                            Brightness = maxBrightness,
+                                            Contrast = maxContrast,
+                                        },
+                                    },
+                                });
                             }
                         }
                     }
@@ -498,8 +821,12 @@ namespace rebellagamma
             var profiles = GetSavedProfiles();
             foreach (var profile in profiles)
             {
-                comboBoxProfiles.Items.Add(profile.Item1);
+                comboBoxProfiles.Items.Add(profile.Name);
             }
+
+            var defaultProfile = profiles.FirstOrDefault();
+            if (defaultProfile != null)
+                LoadProfile(defaultProfile);
         }
 
         private void trackBar_Enter_RemoveFocus(object sender, EventArgs e)
@@ -568,24 +895,8 @@ namespace rebellagamma
 
         private void numericUpDownAR_KeyDown(object sender, KeyEventArgs e)
         {
-            if (e.KeyCode == Keys.Enter)
-            {
-                e.Handled = true;
-                e.SuppressKeyPress = true;
-
-                switch (((NumericUpDown)sender).Name)
-                {
-                    case "numericUpDownAR1":
-                        buttonSaveAR1.PerformClick();
-                        break;
-                    case "numericUpDownAR2":
-                        buttonSaveAR2.PerformClick();
-                        break;
-                    case "numericUpDownTargetAR":
-                        buttonSetAR3.PerformClick();
-                        break;
-                }
-            }
+            trackBarAR.Value = (int)((float)numericUpDownTargetAR.Value * 100.0f);
+            ApplyAllSettings();
         }
     }
 }
